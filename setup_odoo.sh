@@ -66,7 +66,7 @@ load_config() {
 # --- Configuration Variables ---
 # Feel free to change these values to match your requirements.
 
-ODOO_VERSION="16.0"                 # The version of Odoo to install.
+ODOO_VERSION="18.0"                 # The version of Odoo to install.
 ODOO_CONTAINER_NAME="odoo"          # The name for the Odoo Docker container.
 DB_CONTAINER_NAME="db"              # The name for the PostgreSQL Docker container.
 DB_USER="odoo"                      # The PostgreSQL user for Odoo.
