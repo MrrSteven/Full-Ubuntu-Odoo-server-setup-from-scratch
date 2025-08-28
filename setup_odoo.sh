@@ -31,23 +31,180 @@ readonly NC='\033[0m' # No Color
 
 # --- Logging Functions ---
 log_success() { echo -e "${GREEN}✅  $1${NC}"; }
-log_error() { echo -e "${RED}❌  ERROR: $1${NC}" >&2; }
+log_error() { echo -e "${RED}❌  $1${NC}"; } # Simplified for status checks
 log_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
 log_warning() { echo -e "${YELLOW}⚠️  WARNING: $1${NC}"; }
 
 # --- Error Trap ---
 # This function will be executed when any command fails before the script exits.
 on_error() {
-    log_error "Script failed on line $1. Aborting."
+    # Don't show the error if we are exiting cleanly from status mode
+    if [[ "${BASH_COMMAND}" != "exit 0" ]]; then
+        log_error "Script failed on line $LINENO. Aborting."
+    fi
 }
 trap 'on_error $LINENO' ERR
 
-# --- Function Definitions ---
+# --- Status Check Feature ---
+
+# State variables for the final summary
+DOCKER_STATUS="FAIL"
+POSTGRES_STATUS="FAIL"
+ODOO_STATUS="FAIL"
+
+check_docker_component() {
+    echo -e "\n${BLUE}--- Component: Docker ---${NC}"
+    # Assume PASS until a check fails
+    DOCKER_STATUS="PASS"
+
+    # Check Service Status
+    if sudo systemctl is-active --quiet docker; then
+        log_success "Docker service is active and running."
+    else
+        log_error "Docker service is NOT running."
+        DOCKER_STATUS="FAIL"
+    fi
+
+    # Display System Logs
+    echo "  -> Last 20 Docker Service Logs (journalctl):"
+    sudo journalctl -u docker.service -n 20 --no-pager
+}
+
+check_postgres_component() {
+    echo -e "\n${BLUE}--- Component: PostgreSQL ---${NC}"
+    local container_name="$DB_CONTAINER_NAME"
+    # Assume PASS until a check fails
+    POSTGRES_STATUS="PASS"
+
+    # Check Container Existence
+    if ! sudo docker ps -a --filter "name=^/${container_name}$" --format '{{.Names}}' | grep -q .; then
+        log_error "PostgreSQL container ('${container_name}') does not exist."
+        POSTGRES_STATUS="FAIL"
+        return
+    else
+        log_success "PostgreSQL container ('${container_name}') exists."
+    fi
+
+    # Check Container Status
+    local status
+    status=$(sudo docker ps --filter "name=^/${container_name}$" --format '{{.Status}}' || true)
+    if [[ "$status" == "Up"* ]]; then
+        log_success "PostgreSQL container ('${container_name}') is running."
+    else
+        log_error "PostgreSQL container ('${container_name}') is NOT running. (Status: ${status:-'Not running or does not exist'})"
+        POSTGRES_STATUS="FAIL"
+    fi
+
+    # Check Service Readiness (only if container is running)
+    if [[ "$status" == "Up"* ]]; then
+        # Guard with `|| true` in case container logs are empty or it exits
+        local logs
+        logs=$(sudo docker logs "$container_name" --tail 50 2>&1 || true)
+        if echo "$logs" | grep -q "database system is ready to accept connections"; then
+            log_success "PostgreSQL service is ready to accept connections."
+        else
+            log_error "PostgreSQL service is not yet ready."
+            POSTGRES_STATUS="FAIL"
+        fi
+    fi
+
+    # Display Container Logs (Error Focused)
+    echo "  -> Health Check for ${container_name} Logs:"
+    local all_logs
+    all_logs=$(sudo docker logs "$container_name" --tail 100 2>&1 || true)
+    local error_logs
+    error_logs=$(echo "$all_logs" | grep -iE "ERROR|FATAL|PANIC" || true)
+    if [ -n "$error_logs" ]; then
+        log_warning "Found lines with potential error keywords in '${container_name}':"
+        echo "$error_logs" | sed -E "s/(ERROR|FATAL|PANIC)/${RED}\1${NC}/gi"
+        POSTGRES_STATUS="FAIL" # Finding critical errors is a failure
+    else
+        log_success "No recent critical errors found in '${container_name}' logs."
+        echo "    Last 10 log lines:"
+        echo "$all_logs" | tail -n 10 | sed 's/^/    /'
+    fi
+}
+
+check_odoo_component() {
+    echo -e "\n${BLUE}--- Component: Odoo ---${NC}"
+    local container_name="$ODOO_CONTAINER_NAME"
+    # Assume PASS until a check fails
+    ODOO_STATUS="PASS"
+
+    # Check Container Existence
+    if ! sudo docker ps -a --filter "name=^/${container_name}$" --format '{{.Names}}' | grep -q .; then
+        log_error "Odoo container ('${container_name}') does not exist."
+        ODOO_STATUS="FAIL"
+        return
+    else
+        log_success "Odoo container ('${container_name}') exists."
+    fi
+
+    # Check Container Status
+    local status
+    status=$(sudo docker ps --filter "name=^/${container_name}$" --format '{{.Status}}' || true)
+    if [[ "$status" == "Up"* ]]; then
+        log_success "Odoo container ('${container_name}') is running."
+    else
+        log_error "Odoo container ('${container_name}') is NOT running. (Status: ${status:-'Not running or does not exist'})"
+        ODOO_STATUS="FAIL"
+    fi
+
+    # Check Service Readiness (only if container is running)
+    if [[ "$status" == "Up"* ]]; then
+        local logs
+        logs=$(sudo docker logs "$container_name" --tail 50 2>&1 || true)
+        if echo "$logs" | grep -q "werkzeug: Running on http://0.0.0.0:8069/"; then
+            log_success "Odoo HTTP service is running and bound to port 8069."
+        else
+            log_error "Odoo HTTP service has not started yet."
+            ODOO_STATUS="FAIL"
+        fi
+    fi
+
+    # Display Container Logs (Error Focused)
+    echo "  -> Health Check for ${container_name} Logs:"
+    local all_logs
+    all_logs=$(sudo docker logs "$container_name" --tail 100 2>&1 || true)
+    local error_logs
+    error_logs=$(echo "$all_logs" | grep -iE "ERROR|WARNING|FAIL|CRITICAL" || true)
+    if [ -n "$error_logs" ]; then
+        log_warning "Found lines with potential error keywords in '${container_name}':"
+        echo "$error_logs" | sed -E "s/(ERROR|WARNING|FAIL|CRITICAL)/${RED}\1${NC}/gi"
+        # A warning might not be a hard fail, but an error is.
+        if echo "$error_logs" | grep -qiE "ERROR|FAIL|CRITICAL"; then
+            ODOO_STATUS="FAIL"
+        fi
+    else
+        log_success "No recent errors or warnings found in '${container_name}' logs."
+        echo "    Last 10 log lines:"
+        echo "$all_logs" | tail -n 10 | sed 's/^/    /'
+    fi
+}
+
+print_summary_report() {
+    echo -e "\n${BLUE}--- Final Summary ---${NC}"
+
+    print_status_line() {
+        local component=$1
+        local status=$2
+        local color
+        if [ "$status" == "PASS" ]; then
+            color=$GREEN
+        else
+            color=$RED
+        fi
+        printf "%-15s: ${color}%s${NC}\n" "$component" "$status"
+    }
+
+    print_status_line "Docker" "$DOCKER_STATUS"
+    print_status_line "PostgreSQL" "$POSTGRES_STATUS"
+    print_status_line "Odoo" "$ODOO_STATUS"
+}
 
 run_status_check() {
     log_info "Running in Status Check mode..."
 
-    # Status mode needs the config file to know container names
     if [ ! -f "setup.conf" ]; then
         log_error "Configuration file 'setup.conf' not found. Cannot check status."
         log_info "Please run the script without arguments first to create the configuration."
@@ -56,66 +213,13 @@ run_status_check() {
     # shellcheck source=/dev/null
     source "setup.conf"
 
-    # 1. Check Docker Service
-    echo -e "\n${BLUE}--- Docker Service Status ---${NC}"
-    if sudo systemctl is-active --quiet docker; then
-        log_success "Docker service is active and running."
-    else
-        log_error "Docker service is NOT running."
-    fi
-
-    # 2. Check Container Status
-    echo -e "\n${BLUE}--- Container Status ---${NC}"
-    for container in "$ODOO_CONTAINER_NAME" "$DB_CONTAINER_NAME"; do
-      # Use docker ps --format to get just the status, redirecting stderr to hide "docker ps" header if no containers running
-      status=$(sudo docker ps -f "name=^/${container}$" --format "{{.Status}}" 2>/dev/null || echo "")
-      if [ -z "$status" ]; then
-          log_warning "Container '${container}' does not exist or is not running."
-      elif [[ "$status" == *"Up"* ]]; then
-        log_success "Container '${container}' is running. (Status: $status)"
-      else
-        log_warning "Container '${container}' is NOT running. (Status: $status)"
-      fi
-    done
-
-    # 3. Display System Logs
-    echo -e "\n${BLUE}--- Last 20 Docker Service Logs (journalctl) ---${NC}"
-    sudo journalctl -u docker.service -n 20 --no-pager
-
-    # 4. Display Container Logs (Error Focused)
-    check_container_logs() {
-      local container_name="$1"
-      echo -e "\n${BLUE}--- Health Check for ${container_name} Logs ---${NC}"
-
-      # Check if container exists at all
-      if ! sudo docker ps -a -f "name=^/${container_name}$" -q &>/dev/null; then
-          log_warning "Container '${container_name}' does not exist. Cannot fetch logs."
-          return
-      fi
-
-      # Get last 100 lines, redirecting stderr to stdout to capture all output
-      logs=$(sudo docker logs "$container_name" --tail 100 2>&1)
-
-      # Grep for keywords, case-insensitive
-      error_logs=$(echo "$logs" | grep -iE "ERROR|WARNING|FAIL|CRITICAL" || true)
-
-      if [ -n "$error_logs" ]; then
-        log_warning "Found lines with potential error keywords in '${container_name}':"
-        # Use color to highlight the keywords
-        echo "$error_logs" | sed -E "s/(ERROR|WARNING|FAIL|CRITICAL)/${RED}\1${NC}/gi"
-      else
-        log_success "No recent errors or warnings found in '${container_name}' logs."
-        echo "Displaying last 10 log lines:"
-        echo "------------------------------------"
-        echo "$logs" | tail -n 10
-        echo "------------------------------------"
-      fi
-    }
-
-    check_container_logs "$ODOO_CONTAINER_NAME"
-    check_container_logs "$DB_CONTAINER_NAME"
+    check_docker_component
+    check_postgres_component
+    check_odoo_component
+    print_summary_report
 }
 
+# --- Original Setup Functions ---
 
 check_prerequisites() {
     log_info "Running prerequisite checks..."
@@ -137,27 +241,22 @@ load_config() {
 
     if [ ! -f "$CONFIG_FILE" ]; then
         log_info "Configuration file not found. Creating default 'setup.conf'."
-        # Generate secure random passwords
         DB_PASSWORD=$(openssl rand -base64 16)
         ODOO_MASTER_PASSWORD=$(openssl rand -base64 16)
-        # Define default paths using an absolute path to the user's home directory
         BASE_PATH_DEFAULT="$HOME/odoo-data"
 
         cat > "$CONFIG_FILE" << EOF
 # --- Configuration Variables ---
-# Feel free to change these values to match your requirements.
-
-ODOO_VERSION="18.0"                 # The version of Odoo to install.
-ODOO_CONTAINER_NAME="odoo"          # The name for the Odoo Docker container.
-DB_CONTAINER_NAME="db"              # The name for the PostgreSQL Docker container.
-DB_USER="odoo"                      # The PostgreSQL user for Odoo.
-DB_PASSWORD="${DB_PASSWORD}"  # IMPORTANT: This was a securely generated password.
-ODOO_MASTER_PASSWORD="${ODOO_MASTER_PASSWORD}" # IMPORTANT: This was a securely generated master password.
-ODOO_PORT="8069"                    # The port on which Odoo will be accessible.
-ODOO_NETWORK="odoo-net"             # The name for the dedicated Docker network.
+ODOO_VERSION="18.0"
+ODOO_CONTAINER_NAME="odoo"
+DB_CONTAINER_NAME="db"
+DB_USER="odoo"
+DB_PASSWORD="${DB_PASSWORD}"
+ODOO_MASTER_PASSWORD="${ODOO_MASTER_PASSWORD}"
+ODOO_PORT="8069"
+ODOO_NETWORK="odoo-net"
 
 # --- Paths ---
-# These paths are absolute and should not contain variables like \$HOME or ~.
 BASE_PATH="${BASE_PATH_DEFAULT}"
 ODOO_ADDONS_PATH="${BASE_PATH_DEFAULT}/addons"
 ODOO_CONFIG_PATH="${BASE_PATH_DEFAULT}/config"
@@ -165,13 +264,11 @@ DB_DATA_PATH="${BASE_PATH_DEFAULT}/postgres"
 BACKUP_PATH="${BASE_PATH_DEFAULT}/backups"
 EOF
         log_success "New 'setup.conf' created with secure, random passwords."
-        # Secure the config file, as it contains passwords.
         chmod 600 "$CONFIG_FILE"
         log_success "Set permissions for '$CONFIG_FILE' to 600 (read/write for owner only)."
         log_warning "Please review 'setup.conf' and store the passwords in a safe place."
     fi
 
-    # Source the configuration file safely. It now contains absolute paths.
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
     log_success "Configuration loaded from $CONFIG_FILE"
@@ -252,7 +349,6 @@ start_container() {
     local container_name="$1"
     shift
 
-    # The `^/` and `$` are used to ensure an exact match on the container name.
     if [ "$(docker ps -q -f name=^/"${container_name}"$)" ]; then
         log_info "${container_name} container is already running."
         return
@@ -298,14 +394,9 @@ configure_backup_function() {
     if ! grep -q "backup_odoo_db" ~/.bashrc; then
         log_info "Adding 'backup_odoo_db' command to your .bashrc for easy backups."
 
-        # The variables are now absolute and safe to embed directly
         cat >> ~/.bashrc << EOF
-
 # Odoo Backup Function
 # Generated by Odoo setup script
-# Note: The configuration values below are set when this function is created.
-# If you change them in setup.conf, you will need to re-run this setup script
-# or manually update this function in your ~/.bashrc file.
 backup_odoo_db() {
     local TIMESTAMP=\$(date +%Y%m%d_%H%M%S)
     local BACKUP_FILE="${BACKUP_PATH}/dump_\${TIMESTAMP}.sql"
@@ -345,7 +436,6 @@ print_final_instructions() {
     echo "============================================================"
 }
 
-
 # --- Main Execution ---
 main() {
     # Argument parsing for status mode
@@ -355,6 +445,7 @@ main() {
     fi
 
     # Default setup logic
+    log_info "Starting Odoo Setup..."
     check_prerequisites
     load_config
     install_docker
