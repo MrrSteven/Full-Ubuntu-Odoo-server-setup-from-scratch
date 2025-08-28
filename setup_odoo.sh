@@ -239,7 +239,6 @@ ODOO_CONFIG_FILE_PATH="${BASE_PATH_DEFAULT}/config/odoo.conf"
 BASE_PATH="${BASE_PATH_DEFAULT}"
 ODOO_ADDONS_PATH="${BASE_PATH_DEFAULT}/addons"
 ODOO_CONFIG_PATH="${BASE_PATH_DEFAULT}/config"
-DB_DATA_PATH="${BASE_PATH_DEFAULT}/postgres"
 BACKUP_PATH="${BASE_PATH_DEFAULT}/backups"
 EOF
         log_success "New 'setup.conf' created."
@@ -257,10 +256,11 @@ EOF
 
 create_directories() {
     log_info "Creating and securing data directories..."
-    mkdir -p "$ODOO_ADDONS_PATH" "$ODOO_CONFIG_PATH" "$DB_DATA_PATH" "$BACKUP_PATH"
+    # The postgres data is handled by a Docker named volume, so we don't create a host directory for it.
+    mkdir -p "$ODOO_ADDONS_PATH" "$ODOO_CONFIG_PATH" "$BACKUP_PATH"
     log_info "Updating addons folder ownership for container access..."
     sudo chown -R 101:101 "$ODOO_ADDONS_PATH"
-    chmod 700 "$ODOO_ADDONS_PATH" "$ODOO_CONFIG_PATH" "$DB_DATA_PATH" "$BACKUP_PATH"
+    chmod 700 "$ODOO_ADDONS_PATH" "$ODOO_CONFIG_PATH" "$BACKUP_PATH"
     log_success "Data directories created and secured."
 }
 
@@ -297,7 +297,7 @@ services:
       - POSTGRES_DB=postgres
     restart: always
     volumes:
-      - \${DB_DATA_PATH}:/var/lib/postgresql/data
+      - db_data:/var/lib/postgresql/data
     networks:
       - odoo-net
   odoo:
@@ -316,6 +316,9 @@ services:
 networks:
   odoo-net:
     name: \${ODOO_NETWORK}
+
+volumes:
+  db_data:
 EOF
     log_success "docker-compose.yml file created."
 }
