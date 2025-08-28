@@ -248,6 +248,10 @@ EOF
         log_warning "Please store passwords securely."
     fi
     source "$CONFIG_FILE"
+
+    # For backward compatibility, if ODOO_CONFIG_FILE_PATH is not in setup.conf, create it from the base config path.
+    ODOO_CONFIG_FILE_PATH=${ODOO_CONFIG_FILE_PATH:-"${ODOO_CONFIG_PATH}/odoo.conf"}
+
     log_success "Configuration loaded from $CONFIG_FILE"
 }
 
