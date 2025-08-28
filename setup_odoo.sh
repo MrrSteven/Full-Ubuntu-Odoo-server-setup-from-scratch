@@ -13,6 +13,7 @@
 # 7.  Creates a custom odoo.conf file for better configuration management.
 # 8.  Starts PostgreSQL and Odoo containers on the dedicated network.
 # 9.  Provides a function for easy database backups.
+# 10. Includes a 'status' mode to check the health of the services.
 # =================================================================================================
 
 # --- Script Execution Settings ---
@@ -21,11 +22,18 @@
 # -o pipefail: The return value of a pipeline is the status of the last command to exit with a non-zero status.
 set -euo pipefail
 
+# --- Formatting Variables ---
+readonly GREEN='\033[0;32m'
+readonly RED='\033[0;31m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
+
 # --- Logging Functions ---
-log_success() { echo "✅  $1"; }
-log_error() { echo "❌  ERROR: $1" >&2; }
-log_info() { echo "ℹ️  $1"; }
-log_warning() { echo "⚠️  WARNING: $1"; }
+log_success() { echo -e "${GREEN}✅  $1${NC}"; }
+log_error() { echo -e "${RED}❌  ERROR: $1${NC}" >&2; }
+log_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
+log_warning() { echo -e "${YELLOW}⚠️  WARNING: $1${NC}"; }
 
 # --- Error Trap ---
 # This function will be executed when any command fails before the script exits.
@@ -35,6 +43,79 @@ on_error() {
 trap 'on_error $LINENO' ERR
 
 # --- Function Definitions ---
+
+run_status_check() {
+    log_info "Running in Status Check mode..."
+
+    # Status mode needs the config file to know container names
+    if [ ! -f "setup.conf" ]; then
+        log_error "Configuration file 'setup.conf' not found. Cannot check status."
+        log_info "Please run the script without arguments first to create the configuration."
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "setup.conf"
+
+    # 1. Check Docker Service
+    echo -e "\n${BLUE}--- Docker Service Status ---${NC}"
+    if sudo systemctl is-active --quiet docker; then
+        log_success "Docker service is active and running."
+    else
+        log_error "Docker service is NOT running."
+    fi
+
+    # 2. Check Container Status
+    echo -e "\n${BLUE}--- Container Status ---${NC}"
+    for container in "$ODOO_CONTAINER_NAME" "$DB_CONTAINER_NAME"; do
+      # Use docker ps --format to get just the status, redirecting stderr to hide "docker ps" header if no containers running
+      status=$(sudo docker ps -f "name=^/${container}$" --format "{{.Status}}" 2>/dev/null || echo "")
+      if [ -z "$status" ]; then
+          log_warning "Container '${container}' does not exist or is not running."
+      elif [[ "$status" == *"Up"* ]]; then
+        log_success "Container '${container}' is running. (Status: $status)"
+      else
+        log_warning "Container '${container}' is NOT running. (Status: $status)"
+      fi
+    done
+
+    # 3. Display System Logs
+    echo -e "\n${BLUE}--- Last 20 Docker Service Logs (journalctl) ---${NC}"
+    sudo journalctl -u docker.service -n 20 --no-pager
+
+    # 4. Display Container Logs (Error Focused)
+    check_container_logs() {
+      local container_name="$1"
+      echo -e "\n${BLUE}--- Health Check for ${container_name} Logs ---${NC}"
+
+      # Check if container exists at all
+      if ! sudo docker ps -a -f "name=^/${container_name}$" -q &>/dev/null; then
+          log_warning "Container '${container_name}' does not exist. Cannot fetch logs."
+          return
+      fi
+
+      # Get last 100 lines, redirecting stderr to stdout to capture all output
+      logs=$(sudo docker logs "$container_name" --tail 100 2>&1)
+
+      # Grep for keywords, case-insensitive
+      error_logs=$(echo "$logs" | grep -iE "ERROR|WARNING|FAIL|CRITICAL" || true)
+
+      if [ -n "$error_logs" ]; then
+        log_warning "Found lines with potential error keywords in '${container_name}':"
+        # Use color to highlight the keywords
+        echo "$error_logs" | sed -E "s/(ERROR|WARNING|FAIL|CRITICAL)/${RED}\1${NC}/gi"
+      else
+        log_success "No recent errors or warnings found in '${container_name}' logs."
+        echo "Displaying last 10 log lines:"
+        echo "------------------------------------"
+        echo "$logs" | tail -n 10
+        echo "------------------------------------"
+      fi
+    }
+
+    check_container_logs "$ODOO_CONTAINER_NAME"
+    check_container_logs "$DB_CONTAINER_NAME"
+}
+
 
 check_prerequisites() {
     log_info "Running prerequisite checks..."
@@ -267,6 +348,13 @@ print_final_instructions() {
 
 # --- Main Execution ---
 main() {
+    # Argument parsing for status mode
+    if [[ "$#" -gt 0 && ( "$1" == "--status" || "$1" == "status" ) ]]; then
+        run_status_check
+        exit 0
+    fi
+
+    # Default setup logic
     check_prerequisites
     load_config
     install_docker
@@ -280,5 +368,5 @@ main() {
     print_final_instructions
 }
 
-# Run the main function
-main
+# Run the main function with all passed arguments
+main "$@"
