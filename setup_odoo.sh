@@ -310,6 +310,12 @@ add_user_to_docker_group() {
 create_directories() {
     log_info "Creating and securing data directories..."
     mkdir -p "$ODOO_ADDONS_PATH" "$ODOO_CONFIG_PATH" "$DB_DATA_PATH" "$BACKUP_PATH"
+
+    # Change ownership of the addons path to the Odoo user's UID (101) from within the container.
+    # This is necessary to allow the Odoo process to read and write to the mounted volume.
+    log_info "Updating addons folder ownership for container access..."
+    sudo chown -R 101:101 "$ODOO_ADDONS_PATH"
+
     chmod 700 "$ODOO_ADDONS_PATH" "$ODOO_CONFIG_PATH" "$DB_DATA_PATH" "$BACKUP_PATH"
     log_success "Data directories created and secured."
 }
